@@ -1191,7 +1191,6 @@ def cmd_export(db: dict[str, Any], target: str, zip_path: str) -> int:
         "files_included": [],
     }
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(EXPORT_MANIFEST, json.dumps(manifest, indent=2))
         for rel_name, path in (
             ("requirements.txt", paths["requirements"]),
             ("activate.ps1", paths["activate_ps1"]),
