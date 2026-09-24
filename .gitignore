@@ -1,0 +1,27 @@
+# Local registry (contains machine-specific paths; create from venvs.json.example)
+venvs.json
+
+# Optional local config (copy from venv.config.json.example)
+venv.config.json
+
+# Workspace data — never commit secrets or venv trees
+virtual_envs/
+**/.venv/
+**/.env
+**/env.cmd
+**/.claude-code/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Export artifacts
+*.zip

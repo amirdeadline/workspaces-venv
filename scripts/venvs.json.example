@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "updated_at": "2026-01-01T00:00:00Z",
+  "paths": {
+    "root": "{root}",
+    "virtual_envs": "{root}/virtual_envs",
+    "scripts": "{root}/scripts",
+    "hooks": "{root}/scripts/hooks",
+    "database": "{root}/scripts/venvs.json"
+  },
+  "defaults": {
+    "venv_dir_name": ".venv",
+    "env_file_name": ".env",
+    "requirements_file": "requirements.txt",
+    "python": "C:\\Path\\To\\Python312\\python.exe"
+  },
+  "workspaces": [],
+  "aliases": []
+}

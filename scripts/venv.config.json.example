@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "virtual_envs_dir": "virtual_envs",
+  "venv_dir_name": ".venv",
+  "env_file_name": ".env",
+  "requirements_file": "requirements.txt",
+  "default_python": "",
+  "default_cd_on_activate": true,
+  "list_description_max_width": 60,
+  "export_include_venv": true,
+  "export_include_env": true,
+  "export_include_claude_config": false,
+  "user_bin": ""
+}
