@@ -43,21 +43,32 @@ After you clone or copy this repo onto a share, the live layout should look like
 
 ---
 
-## First-time install (new PC)
+## First-time install (new PC) — git clone
 
-1. Map or open the shared `<workspaces-root>` folder.
-2. Copy config templates (once per share):
+1. Clone this repository (any folder on your PC or a shared drive):
 
    ```cmd
-   copy scripts\venvs.json.example scripts\venvs.json
+   git clone https://github.com/amirdeadline/workspaces-venv.git
+   cd workspaces-venv
+   ```
+
+2. Create and edit config (required before `install.py`):
+
+   ```cmd
    copy scripts\venv.config.json.example scripts\venv.config.json
+   copy scripts\venvs.json.example scripts\venvs.json
+   notepad scripts\venv.config.json
    ```
 
-3. Install CLI for **your Windows user** (no admin required):
+   Set `default_python` to your Python 3.10+ executable if auto-detection is not enough (leave empty to use the interpreter that runs `install.py`).
+
+3. Install the CLI for **your Windows user** (no admin required):
 
    ```cmd
-   python <workspaces-root>\scripts\install.py --path <workspaces-root>
+   python install.py
    ```
+
+   `install.py` at the repo root forwards to `scripts\install.py` and sets `--path` to the clone directory. It creates `virtual_envs\`, ensures `venvs.json` exists, then registers `venv` / `litellm` on PATH.
 
 4. Close the window, open a **new** CMD or PowerShell, then:
 
@@ -65,6 +76,14 @@ After you clone or copy this repo onto a share, the live layout should look like
    venv --list
    venv doctor
    ```
+
+### Existing shared layout (no git clone)
+
+If you already have `<workspaces-root>\scripts\venv.py` on a share:
+
+```cmd
+python <workspaces-root>\scripts\install.py --path <workspaces-root>
+```
 
 `install.py` sets user env `WORKSPACES_ROOT`, adds `%USERPROFILE%\bin` to PATH, registers `venv` / `ws` / `litellm`, updates CMD AutoRun and PowerShell profiles, and runs `venv install-shell` to publish workspace shortcuts.
 
@@ -192,21 +211,36 @@ Creates a zip with:
 - `workspace/` — `requirements.txt`, optional `.env`, activate scripts, etc.
 - `dotvenv/` — optional `.venv` tree (see config)
 
+Single workspace:
+
 ```cmd
 venv --export palo --file D:\backup\palo.zip
 venv export palo --file D:\backup\palo.zip
 ```
+
+All registered workspaces (bundle):
+
+```cmd
+venv --export all --file D:\backup\all-workspaces.zip
+```
+
+Bundle layout uses `workspaces-export-all.json` plus `workspaces\<name>\...` per workspace.
 
 ### Import
 
 ```cmd
 venv --import D:\backup\palo.zip --folder D:\workspaces\virtual_envs\palo
 venv import D:\backup\palo.zip --folder D:\workspaces\virtual_envs\palo --recreate-venv
+venv import D:\backup\all-workspaces.zip --folder D:\workspaces\virtual_envs --override
 ```
 
-Use `--recreate-venv` on a new PC (recommended): copied `.venv` trees are often not portable across machines.
+| Flag | Description |
+|------|-------------|
+| `--folder` | Destination directory (single import) or parent directory (`\<name>` subfolders for bundle imports) |
+| `--recreate-venv` | Recreate `.venv` from `requirements.txt` on this PC (recommended on a new machine) |
+| `--override` | If a workspace name already exists, delete the old registry entry and folder before importing |
 
-After import, open a **new** terminal and use the workspace shortcut from `venv -A list`.
+Single-export and bundle-export zips are both supported for `--import`.
 
 ---
 

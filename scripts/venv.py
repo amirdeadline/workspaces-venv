@@ -178,7 +178,7 @@ def load_workspace_config() -> dict[str, Any]:
 
 def default_python_executable() -> str:
     configured = str(WORKSPACE_CONFIG.get("default_python") or "").strip()
-    if configured:
+    if configured and Path(configured).is_file():
         return configured
     defaults_py = ""
     if DB_PATH.exists():
@@ -187,7 +187,7 @@ def default_python_executable() -> str:
             defaults_py = str((data.get("defaults") or {}).get("python") or "").strip()
         except (OSError, json.JSONDecodeError):
             pass
-    if defaults_py:
+    if defaults_py and Path(defaults_py).is_file():
         return defaults_py
     return sys.executable
 
@@ -1169,17 +1169,23 @@ def cmd_alias_delete(db: dict[str, Any], target: str) -> int:
 # ---------------------------------------------------------------------------
 
 EXPORT_MANIFEST = "workspace-export.json"
+EXPORT_ALL_MANIFEST = "workspaces-export-all.json"
 
 
-def cmd_export(db: dict[str, Any], target: str, zip_path: str) -> int:
-    ws = find_workspace(db, target)
+def _export_workspace_into_zip(
+    zf: zipfile.ZipFile,
+    ws: dict[str, Any],
+    path_prefix: str = "",
+) -> dict[str, Any]:
+    """Write one workspace tree into an open ZipFile. Returns per-workspace manifest."""
     paths = workspace_paths(ws)
-    dest = _abspath(zip_path)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    prefix = path_prefix.replace("\\", "/").strip("/")
+    if prefix:
+        prefix = prefix + "/"
     include_venv = bool(WORKSPACE_CONFIG.get("export_include_venv", True))
     include_env = bool(WORKSPACE_CONFIG.get("export_include_env", True))
     include_claude = bool(WORKSPACE_CONFIG.get("export_include_claude_config", False))
-    manifest = {
+    manifest: dict[str, Any] = {
         "export_format_version": EXPORT_FORMAT_VERSION,
         "exported_at": utc_now(),
         "workspace": json.loads(json.dumps(ws)),
@@ -1190,115 +1196,265 @@ def cmd_export(db: dict[str, Any], target: str, zip_path: str) -> int:
         },
         "files_included": [],
     }
-    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for rel_name, path in (
-            ("requirements.txt", paths["requirements"]),
-            ("activate.ps1", paths["activate_ps1"]),
-            ("activate.cmd", paths["activate_cmd"]),
-            ("env.cmd", paths["env_cmd"]),
-        ):
-            if path.is_file():
-                zf.write(path, arcname=f"workspace/{rel_name}")
-                manifest["files_included"].append(rel_name)
-        if include_env and paths["env"].is_file() and paths["env"].stat().st_size > 0:
-            zf.write(paths["env"], arcname="workspace/.env")
-            manifest["files_included"].append(".env")
-        if include_claude:
-            claude_dir = paths["folder"] / ".claude-code"
-            if claude_dir.is_dir():
-                for child in claude_dir.rglob("*"):
-                    if child.is_file():
-                        arc = "workspace/.claude-code/" + child.relative_to(claude_dir).as_posix()
-                        zf.write(child, arcname=arc)
-                manifest["files_included"].append(".claude-code/")
-        if include_venv and paths["venv"].is_dir():
-            for child in paths["venv"].rglob("*"):
+    for rel_name, path in (
+        ("requirements.txt", paths["requirements"]),
+        ("activate.ps1", paths["activate_ps1"]),
+        ("activate.cmd", paths["activate_cmd"]),
+        ("env.cmd", paths["env_cmd"]),
+    ):
+        if path.is_file():
+            zf.write(path, arcname=f"{prefix}workspace/{rel_name}")
+            manifest["files_included"].append(rel_name)
+    if include_env and paths["env"].is_file() and paths["env"].stat().st_size > 0:
+        zf.write(paths["env"], arcname=f"{prefix}workspace/.env")
+        manifest["files_included"].append(".env")
+    if include_claude:
+        claude_dir = paths["folder"] / ".claude-code"
+        if claude_dir.is_dir():
+            for child in claude_dir.rglob("*"):
                 if child.is_file():
-                    arc = "dotvenv/" + child.relative_to(paths["venv"]).as_posix()
+                    arc = prefix + "workspace/.claude-code/" + child.relative_to(claude_dir).as_posix()
                     zf.write(child, arcname=arc)
-            manifest["files_included"].append(".venv/")
-        zf.writestr(EXPORT_MANIFEST, json.dumps(manifest, indent=2))
+            manifest["files_included"].append(".claude-code/")
+    if include_venv and paths["venv"].is_dir():
+        for child in paths["venv"].rglob("*"):
+            if child.is_file():
+                arc = prefix + "dotvenv/" + child.relative_to(paths["venv"]).as_posix()
+                zf.write(child, arcname=arc)
+        manifest["files_included"].append(".venv/")
+    zf.writestr(f"{prefix}{EXPORT_MANIFEST}", json.dumps(manifest, indent=2))
+    return manifest
+
+
+def cmd_export(db: dict[str, Any], target: str, zip_path: str) -> int:
+    if (target or "").strip().lower() == "all":
+        return cmd_export_all(db, zip_path)
+    ws = find_workspace(db, target)
+    dest = _abspath(zip_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        manifest = _export_workspace_into_zip(zf, ws, "")
     print(f"[OK] Exported workspace '{ws['name']}' to {dest}")
     print(f"     Included: {', '.join(manifest['files_included']) or '(manifest only)'}")
-    print("     Note: .venv folders often need recreation on another PC (venv --import recreates from requirements if needed).")
+    print(
+        "     Note: .venv folders often need recreation on another PC "
+        "(venv --import --recreate-venv)."
+    )
     return 0
 
 
-def cmd_import(db: dict[str, Any], zip_path: str, folder: Optional[str], recreate: bool) -> int:
+def cmd_export_all(db: dict[str, Any], zip_path: str) -> int:
+    if not db.get("workspaces"):
+        raise SystemExit("No workspaces registered. Nothing to export.")
+    dest = _abspath(zip_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, str]] = []
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for ws in db["workspaces"]:
+            name = str(ws.get("name") or "")
+            if not name:
+                continue
+            arc_prefix = f"workspaces/{name}"
+            _export_workspace_into_zip(zf, ws, arc_prefix)
+            entries.append({"name": name, "manifest": f"{arc_prefix}/{EXPORT_MANIFEST}"})
+        bundle = {
+            "export_format_version": EXPORT_FORMAT_VERSION,
+            "kind": "all",
+            "exported_at": utc_now(),
+            "workspace_count": len(entries),
+            "entries": entries,
+            "aliases": json.loads(json.dumps(db.get("aliases") or [])),
+        }
+        zf.writestr(EXPORT_ALL_MANIFEST, json.dumps(bundle, indent=2))
+    print(f"[OK] Exported {len(entries)} workspace(s) to {dest}")
+    print(f"     Manifest: {EXPORT_ALL_MANIFEST}")
+    return 0
+
+
+def remove_workspace_if_exists(
+    db: dict[str, Any], name: str, *, force_folder: bool = False
+) -> bool:
+    """Remove a workspace from the registry and disk. Returns True if one was removed."""
+    needle = name.strip().lower()
+    ws = None
+    for item in db.get("workspaces") or []:
+        if str(item.get("name", "")).lower() == needle:
+            ws = item
+            break
+    if not ws:
+        return False
+    paths = workspace_paths(ws)
+    folder = paths["folder"]
+    if folder.exists():
+        under_venvs = VENVS_ROOT.resolve() in folder.resolve().parents
+        under_root = ROOT.resolve() in folder.resolve().parents
+        if under_venvs or under_root or force_folder:
+            shutil.rmtree(folder)
+            print(f"[DONE] Removed folder {folder}")
+        else:
+            raise SystemExit(
+                f"Refusing to delete folder outside workspaces root: {folder}\n"
+                "Use venv delete with confirmation, or import to a path under your root."
+            )
+    db["workspaces"] = [
+        item for item in db["workspaces"] if str(item.get("name", "")).lower() != needle
+    ]
+    shortcut = (ws.get("activate") or {}).get("shortcut") or ws.get("name")
+    launcher = user_bin_dir() / f"{shortcut}.cmd"
+    if launcher.exists():
+        launcher.unlink()
+    return True
+
+
+def _import_workspace_from_zip(
+    db: dict[str, Any],
+    zf: zipfile.ZipFile,
+    arc_prefix: str,
+    src_label: str,
+    folder: Optional[str],
+    recreate: bool,
+    override: bool,
+) -> dict[str, Any]:
+    prefix = arc_prefix.replace("\\", "/").strip("/")
+    if prefix:
+        prefix = prefix + "/"
+    manifest_path = f"{prefix}{EXPORT_MANIFEST}"
+    try:
+        manifest = json.loads(zf.read(manifest_path).decode("utf-8"))
+    except KeyError:
+        raise SystemExit(f"Invalid export (missing {manifest_path})")
+    ws = manifest.get("workspace")
+    if not isinstance(ws, dict):
+        raise SystemExit("Invalid export manifest: missing workspace record")
+    name = validate_name(str(ws.get("name") or ""))
+    exists = any(
+        str(item.get("name", "")).lower() == name.lower() for item in db.get("workspaces") or []
+    )
+    if exists:
+        if not override:
+            raise SystemExit(
+                f"Workspace '{name}' already exists. Use --override to replace it, or venv delete {name}."
+            )
+        if remove_workspace_if_exists(db, name, force_folder=True):
+            print(f"[OK] Replaced existing workspace '{name}' (--override)")
+        save_db(db)
+
+    dest_folder = _abspath(folder) if folder else _abspath(ws.get("folder") or (VENVS_ROOT / name))
+    dest_folder.mkdir(parents=True, exist_ok=True)
+    venv_dir = str((manifest.get("config_snapshot") or {}).get("venv_dir_name") or ".venv")
+    dotvenv_root = dest_folder / venv_dir
+    extracted_any = False
+    ws_prefix = f"{prefix}workspace/"
+    venv_prefix = f"{prefix}dotvenv/"
+    for info in zf.infolist():
+        if info.filename.startswith(ws_prefix):
+            rel = info.filename[len(ws_prefix) :]
+            if not rel or rel.endswith("/"):
+                continue
+            target = dest_folder / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src_fp, open(target, "wb") as out_fp:
+                shutil.copyfileobj(src_fp, out_fp)
+            extracted_any = True
+        elif info.filename.startswith(venv_prefix):
+            rel = info.filename[len(venv_prefix) :]
+            if not rel:
+                continue
+            target = dotvenv_root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src_fp, open(target, "wb") as out_fp:
+                shutil.copyfileobj(src_fp, out_fp)
+            extracted_any = True
+    if not extracted_any:
+        print(f"[WARN] Export for '{name}' contained no workspace/ files; continuing with manifest only.")
+    activate = ws.get("activate") or {}
+    record = make_workspace_record(
+        db,
+        name=name,
+        description=str(ws.get("description") or ""),
+        workdir=str(activate.get("workdir") or dest_folder),
+        pythonpath=list(activate.get("pythonpath") or []),
+        shortcut=str(activate.get("shortcut") or name),
+        do_cd=bool(activate.get("cd", True)),
+        source={"kind": "venv.py import", "from": src_label},
+        folder=dest_folder,
+    )
+    record["venv"]["python"] = python_version_of(dotvenv_root / "Scripts" / "python.exe")
+    write_workspace_helpers(record)
+    python_exe = dotvenv_root / "Scripts" / "python.exe"
+    if recreate or not python_exe.exists():
+        if dotvenv_root.exists():
+            shutil.rmtree(dotvenv_root, ignore_errors=True)
+        create_virtualenv(default_python_executable(), dotvenv_root, prompt=name)
+        req = dest_folder / "requirements.txt"
+        install_packages(dotvenv_root / "Scripts" / "python.exe", req, [])
+        if (dotvenv_root / "Scripts" / "python.exe").exists():
+            freeze_requirements(dotvenv_root / "Scripts" / "python.exe", req)
+        record["venv"]["python"] = python_version_of(dotvenv_root / "Scripts" / "python.exe")
+        write_workspace_helpers(record)
+    db["workspaces"].append(record)
+    return record
+
+
+def cmd_import(
+    db: dict[str, Any],
+    zip_path: str,
+    folder: Optional[str],
+    recreate: bool,
+    override: bool,
+) -> int:
     src = _abspath(zip_path)
     if not src.is_file():
         raise SystemExit(f"Import file not found: {src}")
     with zipfile.ZipFile(src, "r") as zf:
-        try:
-            manifest = json.loads(zf.read(EXPORT_MANIFEST).decode("utf-8"))
-        except KeyError:
-            raise SystemExit(f"Invalid export (missing {EXPORT_MANIFEST})")
-        ws = manifest.get("workspace")
-        if not isinstance(ws, dict):
-            raise SystemExit("Invalid export manifest: missing workspace record")
-        name = validate_name(str(ws.get("name") or ""))
-        for existing in db["workspaces"]:
-            if existing["name"].lower() == name.lower():
-                raise SystemExit(
-                    f"Workspace '{name}' already exists (id {existing['id']}). "
-                    "Delete it first or import under a different name (not yet supported)."
+        names = set(zf.namelist())
+        if EXPORT_ALL_MANIFEST in names:
+            bundle = json.loads(zf.read(EXPORT_ALL_MANIFEST).decode("utf-8"))
+            entries = bundle.get("entries") or []
+            if not entries:
+                raise SystemExit("Bundle export contains no workspaces.")
+            imported: list[str] = []
+            for entry in entries:
+                entry_name = str(entry.get("name") or "")
+                manifest_path = str(entry.get("manifest") or "")
+                if not entry_name or not manifest_path:
+                    continue
+                arc_prefix = manifest_path[: -len("/" + EXPORT_MANIFEST)]
+                dest = None
+                if folder:
+                    dest = str(_abspath(folder) / entry_name)
+                record = _import_workspace_from_zip(
+                    db,
+                    zf,
+                    arc_prefix,
+                    str(src),
+                    dest,
+                    recreate,
+                    override,
                 )
-        dest_folder = _abspath(folder) if folder else _abspath(ws.get("folder") or (VENVS_ROOT / name))
-        dest_folder.mkdir(parents=True, exist_ok=True)
-        venv_dir = str((manifest.get("config_snapshot") or {}).get("venv_dir_name") or ".venv")
-        dotvenv_root = dest_folder / venv_dir
-        extracted_any = False
-        for info in zf.infolist():
-            if info.filename.startswith("workspace/"):
-                rel = info.filename[len("workspace/") :]
-                if not rel or rel.endswith("/"):
-                    continue
-                target = dest_folder / rel
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(info) as src_fp, open(target, "wb") as out_fp:
-                    shutil.copyfileobj(src_fp, out_fp)
-                extracted_any = True
-            elif info.filename.startswith("dotvenv/"):
-                rel = info.filename[len("dotvenv/") :]
-                if not rel:
-                    continue
-                target = dotvenv_root / rel
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(info) as src_fp, open(target, "wb") as out_fp:
-                    shutil.copyfileobj(src_fp, out_fp)
-                extracted_any = True
-        if not extracted_any:
-            print("[WARN] Export contained no workspace/ files; continuing with manifest only.")
-        activate = ws.get("activate") or {}
-        record = make_workspace_record(
-            db,
-            name=name,
-            description=str(ws.get("description") or ""),
-            workdir=str(activate.get("workdir") or dest_folder),
-            pythonpath=list(activate.get("pythonpath") or []),
-            shortcut=str(activate.get("shortcut") or name),
-            do_cd=bool(activate.get("cd", True)),
-            source={"kind": "venv.py import", "from": str(src)},
-            folder=dest_folder,
+                imported.append(record["name"])
+            alias_items = bundle.get("aliases") or []
+            if alias_items:
+                db.setdefault("aliases", [])
+                existing = {str(a.get("name", "")).lower() for a in db["aliases"]}
+                for item in alias_items:
+                    aname = str(item.get("name") or "").strip()
+                    if aname and aname.lower() not in existing:
+                        db["aliases"].append(item)
+                        existing.add(aname.lower())
+            save_db(db)
+            generate_hooks(db)
+            print(f"[OK] Imported {len(imported)} workspace(s) from bundle: {', '.join(imported)}")
+            return 0
+
+        record = _import_workspace_from_zip(
+            db, zf, "", str(src), folder, recreate, override
         )
-        record["venv"]["python"] = python_version_of(dotvenv_root / "Scripts" / "python.exe")
-        write_workspace_helpers(record)
-        python_exe = dotvenv_root / "Scripts" / "python.exe"
-        if recreate or not python_exe.exists():
-            if dotvenv_root.exists():
-                shutil.rmtree(dotvenv_root, ignore_errors=True)
-            create_virtualenv(default_python_executable(), dotvenv_root, prompt=name)
-            req = dest_folder / "requirements.txt"
-            install_packages(dotvenv_root / "Scripts" / "python.exe", req, [])
-            if (dotvenv_root / "Scripts" / "python.exe").exists():
-                freeze_requirements(dotvenv_root / "Scripts" / "python.exe", req)
-            record["venv"]["python"] = python_version_of(dotvenv_root / "Scripts" / "python.exe")
-            write_workspace_helpers(record)
-        db["workspaces"].append(record)
         save_db(db)
         generate_hooks(db)
-    print(f"[OK] Imported workspace '{name}' into {dest_folder}")
-    print(f"     Activate in a NEW terminal with: {(record.get('activate') or {}).get('shortcut') or name}")
+    shortcut = (record.get("activate") or {}).get("shortcut") or record["name"]
+    print(f"[OK] Imported workspace '{record['name']}' into {record.get('folder')}")
+    print(f"     Activate in a NEW terminal with: {shortcut}")
     return 0
 
 
@@ -1500,7 +1656,8 @@ def cmd_var_remove(db: dict[str, Any], ws: dict[str, Any], key: str) -> int:
 
 def cmd_delete(db: dict[str, Any], target: str, yes: bool) -> int:
     ws = find_workspace(db, target)
-    folder = Path(ws["folder"])
+    paths = workspace_paths(ws)
+    folder = paths["folder"]
     print(f"Will delete workspace {ws['id']} ({ws['name']})")
     print(f"  Folder : {folder}")
     if not yes:
@@ -1508,19 +1665,8 @@ def cmd_delete(db: dict[str, Any], target: str, yes: bool) -> int:
         if answer != ws["name"]:
             print("Aborted.")
             return 1
-    if folder.exists() and VENVS_ROOT.resolve() in folder.resolve().parents:
-        shutil.rmtree(folder)
-        print(f"[DONE] Removed {folder}")
-    elif folder.exists():
-        print(f"[SKIP] Refusing to delete folder outside {VENVS_ROOT}: {folder}")
-        return 1
-    db["workspaces"] = [item for item in db["workspaces"] if item["id"] != ws["id"]]
+    remove_workspace_if_exists(db, ws["name"], force_folder=False)
     save_db(db)
-    shortcut = (ws.get("activate") or {}).get("shortcut") or ws["name"]
-    launcher = user_bin_dir() / f"{shortcut}.cmd"
-    if launcher.exists():
-        launcher.unlink()
-        print(f"[DONE] Removed launcher {launcher}")
     generate_hooks(db)
     print(f"[OK] Deleted workspace {ws['name']}")
     return 0
@@ -1752,7 +1898,8 @@ def rewrite_argv(argv: list[str]) -> list[str]:
         rest = argv[:i] + argv[i + 2 :]
         folder = None
         recreate = "--recreate-venv" in rest
-        rest = [a for a in rest if a != "--recreate-venv"]
+        override = "--override" in rest
+        rest = [a for a in rest if a not in ("--recreate-venv", "--override")]
         if "--folder" in rest:
             j = rest.index("--folder")
             if j + 1 >= len(rest):
@@ -1764,6 +1911,8 @@ def rewrite_argv(argv: list[str]) -> list[str]:
             out.extend(["--folder", folder])
         if recreate:
             out.append("--recreate-venv")
+        if override:
+            out.append("--override")
         return [*out, *rest]
 
     if "-A" in argv or "--alias" in argv:
@@ -1857,7 +2006,8 @@ Examples:
   venv.py -A add --name kb --command "cd /d D:\\Projects && code ."
   venv.py -A delete --name kb
   venv.py --export palo --file D:\\backup\\palo.zip
-  venv.py --import D:\\backup\\palo.zip --folder D:\\workspaces\\virtual_envs\\palo
+  venv.py --export all --file D:\\backup\\all-workspaces.zip
+  venv.py --import D:\\backup\\palo.zip --folder D:\\workspaces\\virtual_envs\\palo --override
   venv.py info palo
   venv.py doctor
 """,
@@ -1922,7 +2072,7 @@ Examples:
     alias_p.add_argument("--alias-description", dest="alias_description", default="", help="Optional note (add)")
 
     export_p = sub.add_parser("export", help="Export a workspace to a zip file")
-    export_p.add_argument("export_target", help="Workspace id or name")
+    export_p.add_argument("export_target", help='Workspace id, name, or "all"')
     export_p.add_argument("--file", required=True, help="Output .zip path")
 
     import_p = sub.add_parser("import", help="Import a workspace from an export zip")
@@ -1932,6 +2082,11 @@ Examples:
         "--recreate-venv",
         action="store_true",
         help="Always recreate .venv from requirements.txt on this PC",
+    )
+    import_p.add_argument(
+        "--override",
+        action="store_true",
+        help="Replace an existing workspace with the same name (deletes old folder and registry entry)",
     )
     return parser
 
@@ -2015,6 +2170,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.zip_path,
             getattr(args, "folder", None),
             bool(getattr(args, "recreate_venv", False)),
+            bool(getattr(args, "override", False)),
         )
     parser.print_help()
     return 1

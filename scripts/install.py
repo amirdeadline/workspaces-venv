@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """Install or uninstall workspace CLIs on this Windows user.
 
+Git clone workflow (Windows 11, any PC):
+
+    git clone https://github.com/amirdeadline/workspaces-venv.git
+    cd workspaces-venv
+    copy scripts\\venv.config.json.example scripts\\venv.config.json
+    rem Edit scripts\\venv.config.json (virtual_envs_dir, default_python, ...)
+    copy scripts\\venvs.json.example scripts\\venvs.json
+    python install.py
+
+Or from the scripts folder:
+
+    python scripts\\install.py --path C:\\path\\to\\workspaces-venv
+
 The shared folder can be any path this PC uses:
 
     python Z:\\workspaces\\scripts\\install.py
@@ -39,6 +52,7 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -142,6 +156,55 @@ def find_script(root: Path, name: str) -> Path:
     if not path.is_file():
         raise SystemExit(f"Missing {name}: {path}")
     return path
+
+
+def bootstrap_workspaces_root(root: Path) -> None:
+    """Prepare a fresh git clone (registry, config, virtual_envs folder)."""
+    scripts = root / "scripts"
+    config = scripts / "venv.config.json"
+    example = scripts / "venv.config.json.example"
+    if not config.is_file():
+        raise SystemExit(
+            f"Missing {config}\n\n"
+            "After git clone, copy and edit the config template:\n"
+            f"  copy {example} {config}\n\n"
+            "Then re-run:  python install.py"
+        )
+    venvs_subdir = "virtual_envs"
+    try:
+        raw = json.loads(config.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            venvs_subdir = str(raw.get("virtual_envs_dir") or venvs_subdir).strip() or venvs_subdir
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[WARN] Could not parse {config.name}: {exc}")
+
+    venvs_dir = root / venvs_subdir.replace("\\", "/").strip("/")
+    venvs_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[OK] Workspace data folder: {venvs_dir}")
+
+    registry = scripts / "venvs.json"
+    reg_example = scripts / "venvs.json.example"
+    if not registry.is_file():
+        if reg_example.is_file():
+            shutil.copy2(reg_example, registry)
+            print(f"[OK] Created {registry.name} from {reg_example.name}")
+        else:
+            registry.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "workspaces": [],
+                        "aliases": [],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            print(f"[OK] Created empty {registry.name}")
+
+    hooks = scripts / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
 
 
 def broadcast_environment_change() -> None:
@@ -492,6 +555,7 @@ def cmd_check(root: Path) -> int:
 
 def cmd_install(root: Path) -> int:
     check_python()
+    bootstrap_workspaces_root(root)
     venv_py = find_script(root, "venv.py")
     litellm_py = find_script(root, "litellm.py")
 
@@ -624,9 +688,11 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python Z:\\workspaces\\scripts\\install.py
+  git clone https://github.com/amirdeadline/workspaces-venv.git
+  cd workspaces-venv
+  copy scripts\\venv.config.json.example scripts\\venv.config.json
+  python install.py
   python install.py --path Z:\\workspaces
-  python install.py --path \\\\server\\share\\workspaces
   python install.py --check --path Z:\\workspaces
   python install.py --uninstall --path Z:\\workspaces
 """,

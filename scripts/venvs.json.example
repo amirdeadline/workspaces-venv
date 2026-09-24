@@ -12,7 +12,7 @@
     "venv_dir_name": ".venv",
     "env_file_name": ".env",
     "requirements_file": "requirements.txt",
-    "python": "C:\\Path\\To\\Python312\\python.exe"
+    "python": ""
   },
   "workspaces": [],
   "aliases": []
