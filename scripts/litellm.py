@@ -14,6 +14,8 @@ Usage (from any directory, after install):
     litellm --notification C:\\Windows\\Media\\litellm.wav
                                Save hook notification WAV for litellm Claude sessions
     litellm --usage            Per-project token/cost table + today/7d/30d totals (local log)
+    litellm --model opus-5 D:\\proj -- -p "..." --print
+                               One-shot model for this launch only (does not change palo .env)
 
 Personal subscription Claude in the same repo: use `claude-personal` (palo shell)
 or run `claude` without the LiteLLM env (see palo activate helpers).
@@ -45,6 +47,18 @@ NOTIFICATION_HOOK_TEMPLATE = SCRIPTS_DIR / "claude_play_notification.ps1"
 WORKSPACE_MCP_PY = Path.home() / ".amir" / "workspace_mcp" / "workspace_mcp.py"
 MCP_PROBE_SERVERS = frozenset({"jira", "confluence", "asana"})
 MODEL_CTX_RE = re.compile(r"^(?P<id>.+?)(?:\[(?P<ctx>[^\]]+)\])?$", re.IGNORECASE)
+
+# Friendly aliases for --model / subagent -Model (see `litellm --models` for proxy ids).
+MODEL_ALIASES: dict[str, str] = {
+    "default": "claude-opus-4-8[1m]",
+    "opus-4.8": "claude-opus-4-8[1m]",
+    "opus4.8": "claude-opus-4-8[1m]",
+    "4.8": "claude-opus-4-8[1m]",
+    "opus-48": "claude-opus-4-8[1m]",
+    "opus-5": "claude-opus-5[1m]",
+    "opus5": "claude-opus-5[1m]",
+    "5": "claude-opus-5[1m]",
+}
 
 
 def palo_env_path() -> Path:
@@ -234,6 +248,48 @@ def parse_context_spec(spec: str) -> int:
     if raw.endswith("k"):
         return int(float(raw[:-1]) * 1_000)
     return int(raw)
+
+
+def resolve_model_spec(raw: str | None) -> str | None:
+    """Map alias or full id to MODEL[CTX] spec. None/empty -> no override."""
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    key = text.lower().replace("_", "-")
+    if key in MODEL_ALIASES:
+        return MODEL_ALIASES[key]
+    return text
+
+
+def apply_model_spec_to_env(
+    env: dict[str, str], spec: str, base_url: str, api_key: str, *, validate: bool = True
+) -> tuple[str, int]:
+    """Apply one-shot model + context to launch env (does not write palo .env)."""
+    model_id, context_tokens = parse_model_spec(spec)
+    if validate:
+        payload = fetch_models(base_url, api_key)
+        available = model_ids(payload)
+        limits = model_limits(payload)
+        if model_id not in available:
+            sample = ", ".join(available[:8])
+            more = f" (+{len(available) - 8} more)" if len(available) > 8 else ""
+            raise SystemExit(
+                f"Model '{model_id}' is not available on the proxy.\n"
+                f"Run `litellm --models`. Aliases: {', '.join(sorted(MODEL_ALIASES))}"
+                + (f"\nAvailable includes: {sample}{more}" if available else "")
+            )
+        max_in = limits.get(model_id, (None, None))[0]
+        if max_in is not None and context_tokens > max_in:
+            print(
+                f"[WARN] Context {fmt_context_tokens(context_tokens)} capped to proxy max "
+                f"{fmt_context_tokens(max_in)} for {model_id}."
+            )
+            context_tokens = max_in
+    env["ANTHROPIC_MODEL"] = model_id
+    apply_context_to_env(env, context_tokens)
+    return model_id, context_tokens
 
 
 def parse_model_spec(raw: str) -> tuple[str, int]:
@@ -501,11 +557,19 @@ def cmd_mcp(server: str | None) -> int:
     return int(proc.returncode or 0)
 
 
-def cmd_launch_claude(project_dir: str | None, claude_argv: list[str]) -> int:
+def cmd_launch_claude(
+    project_dir: str | None, claude_argv: list[str], *, model_override: str | None = None
+) -> int:
     target = Path(project_dir or os.getcwd()).resolve()
     if not target.is_dir():
         raise SystemExit(f"Not a directory: {target}")
     env = build_litellm_claude_env()
+    if model_override:
+        spec = resolve_model_spec(model_override)
+        if spec:
+            base, key = load_credentials()
+            apply_model_spec_to_env(env, spec, base, key)
+            print(f"  (one-shot --model {model_override!r} -> {spec}; palo .env unchanged)")
     model = env.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
     ctx = env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") or str(DEFAULT_CONTEXT_TOKENS)
     print(f"Claude Code @ {target}")
@@ -545,6 +609,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Set ANTHROPIC_MODEL on palo; optional context suffix defaults to [1m] "
             "(e.g. claude-opus-4-8, claude-sonnet-4-6[200k])"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        metavar="MODEL[CTX]|ALIAS",
+        dest="model_override",
+        help=(
+            "Use this model for one Claude launch only (does not change palo .env). "
+            "Aliases: opus-4.8 (default 1M), opus-5, or full id from litellm --models "
+            "(e.g. claude-opus-4-8[1m])"
         ),
     )
     parser.add_argument(
@@ -628,7 +702,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         return print_models_table(payload)
 
-    return cmd_launch_claude(launch_path, claude_argv)
+    return cmd_launch_claude(launch_path, claude_argv, model_override=args.model_override)
 
 
 if __name__ == "__main__":
