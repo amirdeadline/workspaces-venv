@@ -5,12 +5,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 WS_ROOT = Path(os.environ.get("WORKSPACES_ROOT") or r"E:\PC3_Shared\workspaces")
+
+# --- Usage report cost highlight thresholds (USD) ---
+# Adjust these to change terminal colors in `litellm --usage` (Cost column + 7-day total).
+# Colors apply only when stdout is a TTY and NO_COLOR is unset.
+
+# Per-project all-time cost: no color below YELLOW_MIN; yellow from YELLOW_MIN up to (but not including) RED_MIN; red from RED_MIN up.
+PROJECT_COST_YELLOW_MIN_USD = 10.0
+PROJECT_COST_RED_MIN_USD = 40.0
+
+# Last 7 days machine total: no color below YELLOW_MIN; yellow from YELLOW_MIN through RED_MIN inclusive; red above RED_MIN.
+TOTAL_7D_YELLOW_MIN_USD = 10.0
+TOTAL_7D_RED_MIN_USD = 30.0
+
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+ANSI_RESET = "\033[0m"
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+ColorLevel = Literal["yellow", "red"] | None
 LOG_DIR = WS_ROOT / "logs"
 LOG_FILE = Path(os.environ.get("LITELLM_USAGE_LOG") or (LOG_DIR / "litellm-usage.jsonl"))
 STATE_FILE = LOG_DIR / "litellm-usage-state.json"
@@ -92,21 +111,145 @@ def _entry_run_usd(row: dict[str, Any]) -> float:
     return float((row.get("cost_usd") or {}).get("run", 0) or 0)
 
 
-def aggregate_by_project(rows: list[dict[str, Any]]) -> list[tuple[str, str, int, float]]:
-    """Return (sort_key, display_label, tokens, usd) sorted by usd desc then tokens."""
-    by_key: dict[str, list[int | float | str]] = {}
+def _project_bucket() -> dict[str, Any]:
+    return {
+        "label": "",
+        "tokens": 0,
+        "usd": 0.0,
+        "last_used": None,
+        "models": set(),
+    }
+
+
+def aggregate_by_project(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-project stats sorted by cost desc, then tokens, then name."""
+    by_key: dict[str, dict[str, Any]] = {}
     for row in rows:
         raw = row.get("project_dir")
         key = str(raw).lower().replace("/", "\\") if raw else ""
         label = project_label(str(raw) if raw else None)
-        bucket = by_key.setdefault(key, [label, 0, 0.0])
-        bucket[1] = int(bucket[1]) + _entry_tokens(row)
-        bucket[2] = float(bucket[2]) + _entry_run_usd(row)
-    out: list[tuple[str, str, int, float]] = []
-    for key, (label, tokens, usd) in by_key.items():
-        out.append((key, str(label), int(tokens), float(usd)))
-    out.sort(key=lambda x: (-x[3], -x[2], x[1].lower()))
+        bucket = by_key.setdefault(key, _project_bucket())
+        bucket["label"] = label
+        bucket["tokens"] = int(bucket["tokens"]) + _entry_tokens(row)
+        bucket["usd"] = float(bucket["usd"]) + _entry_run_usd(row)
+        ts = parse_entry_timestamp(row)
+        if ts is not None:
+            prev = bucket["last_used"]
+            if prev is None or ts > prev:
+                bucket["last_used"] = ts
+        model = row.get("model")
+        if model:
+            bucket["models"].add(str(model))
+    out: list[dict[str, Any]] = []
+    for key, bucket in by_key.items():
+        last: datetime | None = bucket["last_used"]
+        models = sorted(bucket["models"])
+        out.append(
+            {
+                "key": key,
+                "project": str(bucket["label"]),
+                "tokens": int(bucket["tokens"]),
+                "cost_usd": float(bucket["usd"]),
+                "last_used": _iso(last) if last else None,
+                "last_used_local": fmt_last_used_local(last),
+                "models": models,
+                "models_display": ", ".join(models) if models else "-",
+            }
+        )
+    out.sort(key=lambda x: (-x["cost_usd"], -x["tokens"], x["project"].lower()))
     return out
+
+
+def fmt_last_used_local(ts: datetime | None) -> str:
+    if ts is None:
+        return "-"
+    return ts.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def project_cost_color(usd: float) -> ColorLevel:
+    if usd >= PROJECT_COST_RED_MIN_USD:
+        return "red"
+    if usd >= PROJECT_COST_YELLOW_MIN_USD:
+        return "yellow"
+    return None
+
+
+def total_7d_cost_color(usd: float) -> ColorLevel:
+    if usd > TOTAL_7D_RED_MIN_USD:
+        return "red"
+    if usd >= TOTAL_7D_YELLOW_MIN_USD:
+        return "yellow"
+    return None
+
+
+def _color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        except (AttributeError, OSError):
+            pass
+    return True
+
+
+def _apply_color(text: str, level: ColorLevel) -> str:
+    if level is None or not _color_enabled():
+        return text
+    if level == "yellow":
+        return f"{ANSI_YELLOW}{text}{ANSI_RESET}"
+    return f"{ANSI_RED}{text}{ANSI_RESET}"
+
+
+def _visible_len(text: str) -> int:
+    return len(ANSI_RE.sub("", text))
+
+
+def _pad_visible(text: str, width: int) -> str:
+    pad = width - _visible_len(text)
+    if pad <= 0:
+        return text
+    return text + (" " * pad)
+
+
+def _print_bordered_table(headers: list[str], rows: list[list[str]], *, cell_colors: list[list[ColorLevel]] | None = None) -> None:
+    if cell_colors is None:
+        cell_colors = [[None] * len(headers) for _ in rows]
+    styled_rows: list[list[str]] = []
+    for r_idx, row in enumerate(rows):
+        styled: list[str] = []
+        for c_idx, cell in enumerate(row):
+            styled.append(_apply_color(cell, cell_colors[r_idx][c_idx]))
+        styled_rows.append(styled)
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], _visible_len(cell))
+    for row in styled_rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], _visible_len(cell))
+
+    def border(left: str, mid: str, right: str) -> str:
+        parts = [mid.join(["-" * (w + 2) for w in widths])]
+        return left + parts[0] + right
+
+    def fmt_row(cells: list[str]) -> str:
+        return "|" + "|".join(f" {_pad_visible(cells[i], widths[i])} " for i in range(len(cells))) + "|"
+
+    print(border("+", "+", "+"))
+    print(fmt_row(headers))
+    print(border("+", "+", "+"))
+    for row in styled_rows:
+        print(fmt_row(row))
+    print(border("+", "+", "+"))
 
 
 def period_totals(rows: list[dict[str, Any]], since: datetime) -> tuple[int, float]:
@@ -137,9 +280,13 @@ def build_usage_report() -> dict[str, Any]:
     today_start = start_of_today_local()
     week_start = _utcnow() - timedelta(days=7)
     month_start = _utcnow() - timedelta(days=30)
+    projects_raw = aggregate_by_project(rows)
     projects = [
-        {"project": label, "tokens": tokens, "cost_usd": round(usd, 6)}
-        for _key, label, tokens, usd in aggregate_by_project(rows)
+        {
+            **p,
+            "cost_usd": round(float(p["cost_usd"]), 6),
+        }
+        for p in projects_raw
     ]
     t_today, u_today = period_totals(rows, today_start)
     t_7, u_7 = period_totals(rows, week_start)
@@ -157,18 +304,6 @@ def build_usage_report() -> dict[str, Any]:
     }
 
 
-def _print_table(headers: list[str], rows: list[list[str]]) -> None:
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
-    fmt = "  ".join(f"{{:{w}}}" for w in widths)
-    print(fmt.format(*headers))
-    print(fmt.format(*("-" * w for w in widths)))
-    for row in rows:
-        print(fmt.format(*row))
-
-
 def print_machine_usage_report(*, json_output: bool = False) -> int:
     report = build_usage_report()
     if json_output:
@@ -177,31 +312,39 @@ def print_machine_usage_report(*, json_output: bool = False) -> int:
     if not report["projects"]:
         print(f"No LiteLLM usage logged yet on this machine.\nLog: {LOG_FILE}")
         return 0
-    table_rows = [
-        [
-            p["project"],
-            fmt_tokens(int(p["tokens"])),
-            fmt_usd(float(p["cost_usd"])),
-        ]
-        for p in report["projects"]
-    ]
+    table_rows: list[list[str]] = []
+    row_colors: list[list[ColorLevel]] = []
+    for p in report["projects"]:
+        cost = float(p["cost_usd"])
+        cost_str = fmt_usd(cost)
+        table_rows.append(
+            [
+                p["project"],
+                fmt_tokens(int(p["tokens"])),
+                cost_str,
+                str(p.get("last_used_local") or "-"),
+                str(p.get("models_display") or "-"),
+            ]
+        )
+        row_colors.append([None, None, project_cost_color(cost), None, None])
+
     print("LiteLLM usage by project (all time, this machine - palo proxy key)\n")
-    _print_table(["Project", "Tokens", "Cost"], table_rows)
+    _print_bordered_table(
+        ["Project", "Tokens", "Cost", "Last used", "Models"],
+        table_rows,
+        cell_colors=row_colors,
+    )
     tot = report["totals"]
+    u7 = float(tot["last_7_days"]["cost_usd"])
+    cost_7d = _apply_color(fmt_usd(u7), total_7d_cost_color(u7))
+    totals_rows = [
+        ["Today", fmt_tokens(tot["today"]["tokens"]), fmt_usd(float(tot["today"]["cost_usd"]))],
+        ["Last 7 days", fmt_tokens(tot["last_7_days"]["tokens"]), cost_7d],
+        ["Last 30 days", fmt_tokens(tot["last_30_days"]["tokens"]), fmt_usd(float(tot["last_30_days"]["cost_usd"]))],
+    ]
     print()
-    print("Totals (logged runs on this machine for your LiteLLM API key)")
-    print(
-        f"  Today:      {fmt_tokens(tot['today']['tokens'])} tokens  "
-        f"{fmt_usd(float(tot['today']['cost_usd']))}"
-    )
-    print(
-        f"  Last 7 days:  {fmt_tokens(tot['last_7_days']['tokens'])} tokens  "
-        f"{fmt_usd(float(tot['last_7_days']['cost_usd']))}"
-    )
-    print(
-        f"  Last 30 days: {fmt_tokens(tot['last_30_days']['tokens'])} tokens  "
-        f"{fmt_usd(float(tot['last_30_days']['cost_usd']))}"
-    )
+    print("Totals (logged runs on this machine for your LiteLLM API key)\n")
+    _print_bordered_table(["Period", "Tokens", "Cost"], totals_rows)
     print(f"\nLog: {LOG_FILE}")
     return 0
 
