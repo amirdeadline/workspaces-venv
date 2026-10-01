@@ -74,7 +74,8 @@ POWERSHELL_PROFILES = [
 ]
 MARKER_BEGIN = "# >>> workspaces-venv >>>"
 MARKER_END = "# <<< workspaces-venv <<<"
-CORE_LAUNCHERS = ("venv.cmd", "ws.cmd", "litellm.cmd")
+CORE_LAUNCHERS = ("venv.cmd", "ws.cmd", "litellm.cmd", "gitlab.cmd")
+DEFAULT_LITELLM_NOTIFICATION_WAV = r"C:\Windows\Media\litellm.wav"
 USER_ENV_VARS_WE_SET = (USER_ENV_ROOT, "WORKSPACES_SCRIPTS")
 SESSION_ENV_CLEANUP = (
     USER_ENV_ROOT,
@@ -394,6 +395,9 @@ def install_powershell_profiles(root: Path) -> None:
             "if (-not (Get-Command litellm -ErrorAction SilentlyContinue)) {",
             "    function global:litellm { & (Join-Path $env:USERPROFILE 'bin\\litellm.cmd') @args }",
             "}",
+            "if (-not (Get-Command gitlab -ErrorAction SilentlyContinue)) {",
+            "    function global:gitlab { & (Join-Path $env:USERPROFILE 'bin\\gitlab.cmd') @args }",
+            "}",
             MARKER_END,
             "",
         ]
@@ -526,9 +530,41 @@ def delete_local_state() -> None:
         print(f"[WARN] Left non-empty {LOCAL_STATE_DIR}")
 
 
+def setup_litellm_claude_notifications(root: Path) -> None:
+    """Configure litellm Claude Code WAV hooks (best-effort; needs palo .env when run)."""
+    print()
+    print("=== LiteLLM Claude notifications ===")
+    litellm_py = root / "scripts" / "litellm.py"
+    wav = Path(DEFAULT_LITELLM_NOTIFICATION_WAV)
+    if not litellm_py.is_file():
+        print("[SKIP] litellm.py not found")
+        return
+    if not wav.is_file():
+        print(
+            f"[SKIP] Default WAV not found: {wav}\n"
+            "       After install:  litellm --notification C:\\path\\to\\sound.wav"
+        )
+        return
+    env = os.environ.copy()
+    env[USER_ENV_ROOT] = str(root)
+    proc = subprocess.run(
+        [str(python_exe()), str(litellm_py), "--notification", str(wav)],
+        cwd=str(root),
+        env=env,
+    )
+    if proc.returncode == 0:
+        print("[OK] litellm Claude notification hooks configured")
+    else:
+        print(
+            "[WARN] litellm --notification did not complete (palo workspace may not exist yet).\n"
+            "       Run later:  litellm --notification C:\\Windows\\Media\\litellm.wav"
+        )
+
+
 def cmd_check(root: Path) -> int:
     venv_py = root / "scripts" / "venv.py"
     litellm_py = root / "scripts" / "litellm.py"
+    gitlab_py = root / "scripts" / "gitlab.py"
     errors = 0
     print(f"Root        : {root}")
     print(f"Scripts     : {root / 'scripts'}")
@@ -536,12 +572,12 @@ def cmd_check(root: Path) -> int:
     print(f"User bin    : {USER_BIN}")
     print(f"Local state : {LOCAL_STATE_DIR}")
     print(f"WORKSPACES_ROOT (session) : {os.environ.get(USER_ENV_ROOT, '(not set)')}")
-    for name, path in [("venv.py", venv_py), ("litellm.py", litellm_py)]:
+    for name, path in [("venv.py", venv_py), ("litellm.py", litellm_py), ("gitlab.py", gitlab_py)]:
         ok = path.is_file()
         print(f"  {name:<12} {'OK' if ok else 'MISSING'}  {path}")
         if not ok:
             errors += 1
-    for name in ("venv", "litellm"):
+    for name in ("venv", "litellm", "gitlab"):
         path = USER_BIN / f"{name}.cmd"
         ok = path.is_file()
         print(f"  {name + '.cmd':<12} {'OK' if ok else 'MISSING'}  {path}")
@@ -558,10 +594,12 @@ def cmd_install(root: Path) -> int:
     bootstrap_workspaces_root(root)
     venv_py = find_script(root, "venv.py")
     litellm_py = find_script(root, "litellm.py")
+    gitlab_py = find_script(root, "gitlab.py")
 
     print(f"Root        : {root}")
     print(f"venv.py     : {venv_py}")
     print(f"litellm.py  : {litellm_py}")
+    print(f"gitlab.py   : {gitlab_py}")
     print(f"Python      : {python_exe()}")
     print()
 
@@ -579,7 +617,6 @@ def cmd_install(root: Path) -> int:
     write_cmd_launcher("venv", venv_py, root)
     write_cmd_launcher("ws", venv_py, root)
     write_cmd_launcher("litellm", litellm_py, root)
-
     print()
     print("=== PowerShell ExecutionPolicy ===")
     set_execution_policy()
@@ -587,16 +624,19 @@ def cmd_install(root: Path) -> int:
     shell_rc = run_venv_install_shell(root, venv_py)
 
     print()
-    print("=== PowerShell profiles (venv + litellm) ===")
+    print("=== PowerShell profiles (venv + litellm + gitlab) ===")
     install_powershell_profiles(root)
 
     print()
     print("=== CMD AutoRun ===")
     install_cmd_autorun()
 
+    setup_litellm_claude_notifications(root)
+
     write_cmd_launcher("venv", venv_py, root)
     write_cmd_launcher("ws", venv_py, root)
     write_cmd_launcher("litellm", litellm_py, root)
+    write_cmd_launcher("gitlab", gitlab_py, root)
 
     save_local_config(
         {
@@ -613,10 +653,13 @@ def cmd_install(root: Path) -> int:
     print(f"  WORKSPACES_ROOT = {root}")
     print(f"  venv     ->  {USER_BIN / 'venv.cmd'}")
     print(f"  litellm  ->  {USER_BIN / 'litellm.cmd'}")
+    print(f"  gitlab   ->  {USER_BIN / 'gitlab.cmd'}")
     print()
     print("Close this window. Open a NEW cmd or PowerShell, then:")
     print("  venv --list")
     print("  litellm --models")
+    print("  litellm --mcp")
+    print("  litellm --notification C:\\Windows\\Media\\litellm.wav")
     print("  palo")
     print()
     print("Note: Python .venv folders copied from another PC will not run.")
