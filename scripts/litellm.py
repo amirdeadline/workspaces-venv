@@ -13,6 +13,7 @@ Usage (from any directory, after install):
     litellm --mcp asana        Probe palo-asana
     litellm --notification C:\\Windows\\Media\\litellm.wav
                                Save hook notification WAV for litellm Claude sessions
+    litellm --usage            Per-project token/cost table + today/7d/30d totals (local log)
 
 Personal subscription Claude in the same repo: use `claude-personal` (palo shell)
 or run `claude` without the LiteLLM env (see palo activate helpers).
@@ -565,6 +566,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--usage",
+        action="store_true",
+        help=(
+            "Show LiteLLM usage on this machine: per-project tokens and USD (all time), "
+            "plus today / last 7 / last 30 days totals from the local usage log"
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs="?",
         help="Optional project path, or 'models' (same as --models)",
@@ -577,6 +586,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cmd_usage(json_output: bool) -> int:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    from log_litellm_usage import print_machine_usage_report
+
+    return print_machine_usage_report(json_output=json_output)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     wants_models = args.models or args.command == "models"
@@ -586,6 +602,9 @@ def main(argv: list[str] | None = None) -> int:
         claude_argv = claude_argv[1:]
     if args.command and args.command != "models":
         launch_path = args.command
+
+    if args.usage:
+        return cmd_usage(args.json)
 
     if args.mcp is not None:
         return cmd_mcp(args.mcp or None)
