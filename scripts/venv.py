@@ -933,6 +933,14 @@ def generate_hooks(db: dict[str, Any]) -> None:
         "    }",
         "    & $launcher @args",
         "}",
+        "function global:portkey {",
+        "    $launcher = Join-Path $env:USERPROFILE 'bin\\portkey.cmd'",
+        "    if (-not (Test-Path -LiteralPath $launcher)) {",
+        f"        Write-Error 'portkey is not installed. Run: {install_hint_ps}'",
+        "        return",
+        "    }",
+        "    & $launcher @args",
+        "}",
         "function global:Enter-Workspace {",
         "    param([Parameter(Mandatory=$true)][string]$Name)",
         f"    $root = if ($env:{USER_ENV_ROOT}) {{ $env:{USER_ENV_ROOT} }} else {{ $script:WorkspacesRoot }}",
@@ -957,6 +965,7 @@ def generate_hooks(db: dict[str, Any]) -> None:
         'doskey venv="%USERPROFILE%\\bin\\venv.cmd" $*',
         "doskey ws=venv $*",
         'doskey litellm="%USERPROFILE%\\bin\\litellm.cmd" $*',
+        'doskey portkey="%USERPROFILE%\\bin\\portkey.cmd" $*',
         'doskey gitlab="%USERPROFILE%\\bin\\gitlab.cmd" $*',
     ]
     for ws in db["workspaces"]:
@@ -1131,8 +1140,20 @@ def install_shell(db: dict[str, Any]) -> None:
             ]
         ),
     )
+    atomic_write(
+        USER_BIN / "portkey.cmd",
+        "\n".join(
+            [
+                "@echo off",
+                f'if not defined {USER_ENV_ROOT} set "{USER_ENV_ROOT}={ROOT}"',
+                f'"{py}" "{SCRIPTS_DIR / "portkey.py"}" %*',
+                "",
+            ]
+        ),
+    )
     print(f"[INFO] Manager CLI: venv     ->  {SCRIPTS_DIR / 'venv.py'}")
     print(f"[INFO] LiteLLM CLI: litellm  ->  {SCRIPTS_DIR / 'litellm.py'}")
+    print(f"[INFO] Portkey CLI: portkey  ->  {SCRIPTS_DIR / 'portkey.py'}")
     print(f"[INFO] GitLab CLI: gitlab    ->  {SCRIPTS_DIR / 'gitlab.py'}")
     print("[INFO] Open a NEW terminal, then run: venv --list")
     print("[INFO]                          litellm --models")

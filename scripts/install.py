@@ -41,7 +41,7 @@ Uninstall (this user only; does not delete the shared folder or .env files):
 This script:
     - Records the workspaces root in user env WORKSPACES_ROOT (not hardcoded)
     - Adds %USERPROFILE%\\bin to the user PATH
-    - Installs `venv` and `litellm` for CMD and PowerShell
+    - Installs `venv`, `litellm`, `portkey`, and `gitlab` for CMD and PowerShell
     - Hooks PowerShell profiles and CMD AutoRun
     - Writes machine-local hooks in %USERPROFILE%\\.workspaces
 """
@@ -74,7 +74,17 @@ POWERSHELL_PROFILES = [
 ]
 MARKER_BEGIN = "# >>> workspaces-venv >>>"
 MARKER_END = "# <<< workspaces-venv <<<"
-CORE_LAUNCHERS = ("venv.cmd", "ws.cmd", "litellm.cmd", "gitlab.cmd")
+# (launcher name, script filename under scripts/)
+WORKSPACE_CLIS: tuple[tuple[str, str], ...] = (
+    ("venv", "venv.py"),
+    ("ws", "venv.py"),
+    ("litellm", "litellm.py"),
+    ("portkey", "portkey.py"),
+    ("gitlab", "gitlab.py"),
+)
+CORE_LAUNCHERS = tuple(f"{name}.cmd" for name, _ in WORKSPACE_CLIS)
+# PowerShell fallbacks when doskey / hook profile is not loaded yet
+PS_CLI_NAMES = ("venv", "litellm", "portkey", "gitlab")
 DEFAULT_LITELLM_NOTIFICATION_WAV = r"C:\Windows\Media\litellm.wav"
 USER_ENV_VARS_WE_SET = (USER_ENV_ROOT, "WORKSPACES_SCRIPTS")
 SESSION_ENV_CLEANUP = (
@@ -157,6 +167,16 @@ def find_script(root: Path, name: str) -> Path:
     if not path.is_file():
         raise SystemExit(f"Missing {name}: {path}")
     return path
+
+
+def resolve_workspace_clis(root: Path) -> list[tuple[str, Path]]:
+    """Resolve every core CLI launcher to its script path."""
+    return [(name, find_script(root, script)) for name, script in WORKSPACE_CLIS]
+
+
+def write_core_cmd_launchers(root: Path, clis: list[tuple[str, Path]] | None = None) -> None:
+    for name, script in clis or resolve_workspace_clis(root):
+        write_cmd_launcher(name, script, root)
 
 
 def bootstrap_workspaces_root(root: Path) -> None:
@@ -385,19 +405,20 @@ def uninstall_cmd_autorun() -> None:
 def install_powershell_profiles(root: Path) -> None:
     hook = LOCAL_STATE_DIR / "profile.ps1"
     hook_ps = str(hook).replace("'", "''")
+    ps_fallbacks: list[str] = []
+    for cli_name in PS_CLI_NAMES:
+        ps_fallbacks.extend(
+            [
+                f"if (-not (Get-Command {cli_name} -ErrorAction SilentlyContinue)) {{",
+                f"    function global:{cli_name} {{ & (Join-Path $env:USERPROFILE 'bin\\{cli_name}.cmd') @args }}",
+                "}",
+            ]
+        )
     block = "\n".join(
         [
             MARKER_BEGIN,
             f"if (Test-Path -LiteralPath '{hook_ps}') {{ . '{hook_ps}' }}",
-            "if (-not (Get-Command venv -ErrorAction SilentlyContinue)) {",
-            "    function global:venv { & (Join-Path $env:USERPROFILE 'bin\\venv.cmd') @args }",
-            "}",
-            "if (-not (Get-Command litellm -ErrorAction SilentlyContinue)) {",
-            "    function global:litellm { & (Join-Path $env:USERPROFILE 'bin\\litellm.cmd') @args }",
-            "}",
-            "if (-not (Get-Command gitlab -ErrorAction SilentlyContinue)) {",
-            "    function global:gitlab { & (Join-Path $env:USERPROFILE 'bin\\gitlab.cmd') @args }",
-            "}",
+            *ps_fallbacks,
             MARKER_END,
             "",
         ]
@@ -562,9 +583,6 @@ def setup_litellm_claude_notifications(root: Path) -> None:
 
 
 def cmd_check(root: Path) -> int:
-    venv_py = root / "scripts" / "venv.py"
-    litellm_py = root / "scripts" / "litellm.py"
-    gitlab_py = root / "scripts" / "gitlab.py"
     errors = 0
     print(f"Root        : {root}")
     print(f"Scripts     : {root / 'scripts'}")
@@ -572,15 +590,20 @@ def cmd_check(root: Path) -> int:
     print(f"User bin    : {USER_BIN}")
     print(f"Local state : {LOCAL_STATE_DIR}")
     print(f"WORKSPACES_ROOT (session) : {os.environ.get(USER_ENV_ROOT, '(not set)')}")
-    for name, path in [("venv.py", venv_py), ("litellm.py", litellm_py), ("gitlab.py", gitlab_py)]:
+    seen_scripts: set[str] = set()
+    for _launcher, script_name in WORKSPACE_CLIS:
+        if script_name in seen_scripts:
+            continue
+        seen_scripts.add(script_name)
+        path = root / "scripts" / script_name
         ok = path.is_file()
-        print(f"  {name:<12} {'OK' if ok else 'MISSING'}  {path}")
+        print(f"  {script_name:<12} {'OK' if ok else 'MISSING'}  {path}")
         if not ok:
             errors += 1
-    for name in ("venv", "litellm", "gitlab"):
-        path = USER_BIN / f"{name}.cmd"
+    for launcher, _script in WORKSPACE_CLIS:
+        path = USER_BIN / f"{launcher}.cmd"
         ok = path.is_file()
-        print(f"  {name + '.cmd':<12} {'OK' if ok else 'MISSING'}  {path}")
+        print(f"  {launcher + '.cmd':<12} {'OK' if ok else 'MISSING'}  {path}")
         if not ok:
             errors += 1
     user_path = os.environ.get("PATH", "")
@@ -592,14 +615,15 @@ def cmd_check(root: Path) -> int:
 def cmd_install(root: Path) -> int:
     check_python()
     bootstrap_workspaces_root(root)
-    venv_py = find_script(root, "venv.py")
-    litellm_py = find_script(root, "litellm.py")
-    gitlab_py = find_script(root, "gitlab.py")
+    clis = resolve_workspace_clis(root)
+    seen_scripts: set[str] = set()
 
     print(f"Root        : {root}")
-    print(f"venv.py     : {venv_py}")
-    print(f"litellm.py  : {litellm_py}")
-    print(f"gitlab.py   : {gitlab_py}")
+    for _launcher, script_path in clis:
+        if script_path.name in seen_scripts:
+            continue
+        seen_scripts.add(script_path.name)
+        print(f"{script_path.name:<12}: {script_path}")
     print(f"Python      : {python_exe()}")
     print()
 
@@ -614,17 +638,16 @@ def cmd_install(root: Path) -> int:
 
     print()
     print("=== CMD launchers (%USERPROFILE%\\bin) ===")
-    write_cmd_launcher("venv", venv_py, root)
-    write_cmd_launcher("ws", venv_py, root)
-    write_cmd_launcher("litellm", litellm_py, root)
+    write_core_cmd_launchers(root, clis)
     print()
     print("=== PowerShell ExecutionPolicy ===")
     set_execution_policy()
 
+    venv_py = find_script(root, "venv.py")
     shell_rc = run_venv_install_shell(root, venv_py)
 
     print()
-    print("=== PowerShell profiles (venv + litellm + gitlab) ===")
+    print("=== PowerShell profiles (venv + litellm + portkey + gitlab) ===")
     install_powershell_profiles(root)
 
     print()
@@ -633,10 +656,9 @@ def cmd_install(root: Path) -> int:
 
     setup_litellm_claude_notifications(root)
 
-    write_cmd_launcher("venv", venv_py, root)
-    write_cmd_launcher("ws", venv_py, root)
-    write_cmd_launcher("litellm", litellm_py, root)
-    write_cmd_launcher("gitlab", gitlab_py, root)
+    print()
+    print("=== Refresh CMD launchers (after install-shell) ===")
+    write_core_cmd_launchers(root, clis)
 
     save_local_config(
         {
@@ -651,13 +673,15 @@ def cmd_install(root: Path) -> int:
     print()
     print("=== Install complete ===")
     print(f"  WORKSPACES_ROOT = {root}")
-    print(f"  venv     ->  {USER_BIN / 'venv.cmd'}")
-    print(f"  litellm  ->  {USER_BIN / 'litellm.cmd'}")
-    print(f"  gitlab   ->  {USER_BIN / 'gitlab.cmd'}")
+    for launcher, _script in WORKSPACE_CLIS:
+        print(f"  {launcher:<8} ->  {USER_BIN / (launcher + '.cmd')}")
     print()
     print("Close this window. Open a NEW cmd or PowerShell, then:")
     print("  venv --list")
     print("  litellm --models")
+    print("  portkey --status")
+    print("  portkey test")
+    print("  gitlab --login")
     print("  litellm --mcp")
     print("  litellm --notification C:\\Windows\\Media\\litellm.wav")
     print("  palo")
@@ -727,7 +751,7 @@ def cmd_uninstall(root: Path | None) -> int:
 def main(argv: list[str] | None = None) -> int:
     _line_buffer_stdio()
     parser = argparse.ArgumentParser(
-        description="Install or uninstall venv + litellm for this Windows user from a shared workspaces folder.",
+        description="Install or uninstall workspace CLIs (venv, litellm, portkey, gitlab) for this Windows user.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
